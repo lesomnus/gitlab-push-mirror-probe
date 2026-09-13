@@ -186,7 +186,9 @@ jobs:
             st=$(echo "$body" | jq -r '.[0].update_status')
             case "$st" in
             finished | failed)
-              echo "$body" | jq '.[0] | {update_status, last_error, last_successful_update_at, keep_divergent_refs}'
+              echo "$body" | jq '.[0]' >"${GITHUB_WORKSPACE}/mirror.json"
+              jq '{update_status, last_error, last_successful_update_at, keep_divergent_refs}' \
+                <"${GITHUB_WORKSPACE}/mirror.json"
               exit 0
               ;;
             esac
@@ -230,8 +232,20 @@ jobs:
           got=$(git rev-parse refs/remotes/probe/diverged)
           check "diverged ref was NOT forced" "$(cat sentinel.sha)" "$got"
 
-          # GitLab must not have deleted what it does not have.
-          got=$(git ls-remote --heads origin main | wc -l | tr -d ' ')
+          # Leaving it alone is only half of it; an operator has to be able to
+          # find out which ref was held back.
+          got=$(jq -r '.last_error | select(. != null) | test("probe/diverged")' <mirror.json)
+          check "last_error names the ref it held back" true "$got"
+
+          # A mirror that held a ref back reports **failed** for the whole run,
+          # and leaves last_successful_update_at null, even though every other
+          # ref arrived. So `failed` does not mean nothing was delivered, and
+          # the runbook has to say so.
+          check "one held-back ref fails the whole run" failed "$(jq -r .update_status <mirror.json)"
+
+          # GitLab must not have deleted what it does not have. Fully qualified:
+          # ls-remote matches the tail of a ref, so `main` matches probe/main too.
+          got=$(git ls-remote --heads origin refs/heads/main | wc -l | tr -d ' ')
           check "main survived" 1 "$got"
 
           exit "$fail"

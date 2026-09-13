@@ -20,6 +20,27 @@ turns the mirror on, and then checks what actually arrived here.
 
 [wf]: .github/workflows/push-mirror.yaml
 
+## What it found
+
+Both claims hold. The LFS object arrives whole, and a ref that had moved ahead
+on GitHub was left exactly where it was.
+
+One thing the source reading did not predict, and the runbook now has to say:
+
+```json
+{
+  "update_status": "failed",
+  "last_error": "Some refs have diverged and have not been updated on the remote:\n\nrefs/heads/probe/diverged",
+  "last_successful_update_at": null
+}
+```
+
+**`failed` does not mean nothing was delivered.** One held-back ref fails the
+whole run, and `last_successful_update_at` stays `null`, while every other
+branch and tag arrived. An operator who reads the status and stops there will
+conclude the restore did not happen. The refs that were held back are named in
+`last_error`, and that is the field to read.
+
 ## Why the workflow lives in the repository it pushes to
 
 It needs **no personal access token**. The push comes from a GitLab that is
