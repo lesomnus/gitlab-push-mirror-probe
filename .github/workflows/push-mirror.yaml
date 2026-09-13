@@ -1,0 +1,248 @@
+# Does GitLab CE push mirroring actually deliver, and does it refuse to force?
+#
+# `infra/gitlab/restore.sh` in the GitOps repo hands the disaster-recovery push
+# to GitLab instead of running git itself, on two claims:
+#
+#   1. GitLab sends LFS objects before the push, so pointers are not dangling.
+#   2. keep_divergent_refs=true means a remote that has moved ahead is left
+#      alone and reported, never quietly forced.
+#
+# Both claims were read off GitLab's source. This job runs them.
+#
+# It needs no personal access token. The push comes from a GitLab that is
+# created and destroyed inside the job, and the credential it pushes with is
+# this job's own GITHUB_TOKEN -- scoped to this repository, revoked when the job
+# ends. That is why the workflow lives in the repository it pushes to: the
+# automatic token can write nowhere else.
+#
+# WARNING: this repository is the target. Everything under refs/heads/probe/ is
+# rewritten and deleted by this job. Do not keep anything here, and do not point
+# it at a repository that matters -- with keep_divergent_refs=false GitLab
+# deletes remote branches the source does not have, which here would include the
+# branch holding this file.
+name: push-mirror
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "43 5 * * 1"
+
+permissions:
+  contents: write
+
+env:
+  GITLAB: http://localhost:8080
+  # Only ever valid against the throwaway container started below.
+  GITLAB_TOKEN: glpat-pushmirrorprobetoken
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start GitLab
+        run: |
+          set -eu
+          # `puma['port']` has to move off 8080: omnibus defaults puma to
+          # 127.0.0.1:8080 and `external_url` with a port puts nginx on the same
+          # one. We want nginx -- git over HTTP goes through workhorse, and
+          # talking to puma directly fails with `Nil JSON web token`.
+          docker run -d --name gitlab \
+            --shm-size 256m \
+            -p 8080:8080 \
+            -e GITLAB_OMNIBUS_CONFIG="
+              external_url 'http://localhost:8080';
+              puma['port'] = 8081;
+              puma['worker_processes'] = 0;
+              sidekiq['max_concurrency'] = 2;
+              postgresql['shared_buffers'] = '128MB';
+              prometheus_monitoring['enable'] = false;
+              gitlab_rails['gitlab_shell_ssh_port'] = 2222;
+            " \
+            gitlab/gitlab-ce:19.3.1-ce.0
+
+      - name: Wait for it
+        run: |
+          set -eu
+          for i in $(seq 1 60); do
+            # From inside: /-/health is limited to monitoring_whitelist,
+            # 127.0.0.0/8 by default, so the same request from the runner is
+            # refused however healthy GitLab is.
+            if docker exec gitlab curl -fsS http://127.0.0.1:8080/-/health >/dev/null 2>&1; then
+              echo "healthy after $((i * 10))s"
+              exit 0
+            fi
+            # A service whose pid changes between samples is restarting, not
+            # starting. A long timeout hides that distinction.
+            [ $((i % 6)) -ne 0 ] || docker exec gitlab gitlab-ctl status 2>&1 | sed 's/^/  /' || true
+            sleep 10
+          done
+          echo "GitLab did not come up" >&2
+          docker exec gitlab gitlab-ctl status >&2 || true
+          exit 1
+
+      - name: Seed a token and a project
+        run: |
+          set -eu
+          docker exec gitlab gitlab-rails runner "
+            u = User.find_by_username('root')
+            t = u.personal_access_tokens.build(
+              scopes: ['api'], name: 'push-mirror-probe',
+              expires_at: 365.days.from_now)
+            t.set_token('${GITLAB_TOKEN}')
+            t.save!
+            puts 'seeded'
+          "
+          # Prove the token works before blaming the mirror for a 401.
+          curl -fsS -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" "${GITLAB}/api/v4/version" >/dev/null
+
+          curl -fsS -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" -X POST "${GITLAB}/api/v4/projects" \
+            -d name=probe -d path=probe -d visibility=private \
+            -d initialize_with_readme=false >/dev/null
+          echo "project created"
+
+      - name: Put branches, a tag and an LFS object in GitLab
+        run: |
+          set -eu
+          git lfs install --skip-repo
+
+          # No branch here may be named after one this repository has. GitLab is
+          # the source, so a name it shares with the target is a name the mirror
+          # will try to move -- and `main` here holds this workflow.
+          mkdir -p /tmp/src && cd /tmp/src
+          git init -q -b probe/main
+          git config user.email probe@example.invalid
+          git config user.name probe
+
+          git lfs track '*.bin' >/dev/null
+          head -c 4096 /dev/urandom >payload.bin
+          sha256sum payload.bin | cut -d' ' -f1 >"${GITHUB_WORKSPACE}/payload.sha256"
+          echo probe >README.md
+          git add -A
+          git commit -qm 'probe: an LFS object and a readme'
+          git tag probe-v1
+
+          git switch -qc probe/side
+          echo side >side.txt && git add -A && git commit -qm 'probe: a second branch'
+
+          # This one exists on GitHub already, with a different history. The
+          # mirror must leave it alone.
+          git switch -qc probe/diverged probe/main
+          echo gitlab >who.txt && git add -A && git commit -qm 'probe: the GitLab side of a divergence'
+
+          git remote add origin "http://oauth2:${GITLAB_TOKEN}@localhost:8080/root/probe.git"
+          git push -q origin 'refs/heads/probe/*:refs/heads/probe/*' probe-v1
+          echo "pushed to GitLab:"
+          git ls-remote origin | sed 's/^/  /'
+
+      - name: Make the remote diverge before the mirror runs
+        run: |
+          set -eu
+          # actions/checkout left this repository's origin authenticated, so no
+          # token has to be handled here.
+          cd "${GITHUB_WORKSPACE}"
+          git config user.email probe@example.invalid
+          git config user.name probe
+          empty=$(git hash-object -t tree /dev/null)
+          sentinel=$(echo github | git commit-tree "$empty")
+          git push -q --force origin "${sentinel}:refs/heads/probe/diverged"
+          echo "$sentinel" >sentinel.sha
+          echo "sentinel ${sentinel}"
+
+      - name: Turn the mirror on
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # The URL carries the credential, so it goes to curl on stdin rather
+          # than in argv. GitLab stores this URL; a real run must delete the
+          # mirror afterwards and retire the token.
+          cat >/tmp/mirror.conf <<EOF
+          url = "${GITLAB}/api/v4/projects/root%2Fprobe/remote_mirrors"
+          header = "PRIVATE-TOKEN: ${GITLAB_TOKEN}"
+          request = "POST"
+          data-urlencode = "url=https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          data = "enabled=true"
+          data = "keep_divergent_refs=true"
+          EOF
+          curl -sfS --config /tmp/mirror.conf -o /dev/null
+          rm -f /tmp/mirror.conf
+          echo "mirror created"
+
+      - name: Give it something to react to, then wait
+        run: |
+          set -eu
+          # A push mirror runs when the source is pushed to. Ours was pushed
+          # before the mirror existed, so nudge it.
+          cd /tmp/src
+          git switch -q probe/main
+          echo nudge >>README.md && git commit -qam 'probe: nudge the mirror'
+          git push -q origin probe/main
+
+          for i in $(seq 1 40); do
+            body=$(curl -fsS -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+              "${GITLAB}/api/v4/projects/root%2Fprobe/remote_mirrors")
+            st=$(echo "$body" | jq -r '.[0].update_status')
+            case "$st" in
+            finished | failed)
+              echo "$body" | jq '.[0] | {update_status, last_error, last_successful_update_at, keep_divergent_refs}'
+              exit 0
+              ;;
+            esac
+            sleep 15
+          done
+          echo "mirror never ran" >&2
+          exit 1
+
+      - name: What landed
+        run: |
+          set -eu
+          cd "${GITHUB_WORKSPACE}"
+          fail=0
+          check() { if [ "$2" = "$3" ]; then echo "  ok    $1"; else echo "  FAIL  $1: want $2, got $3"; fail=1; fi; }
+
+          git fetch -q origin '+refs/heads/probe/*:refs/remotes/probe/*' '+refs/tags/probe-*:refs/tags/probe-*'
+
+          for b in main side; do
+            got=$(git rev-parse --verify -q "refs/remotes/probe/$b" >/dev/null 2>&1 && echo yes || echo no)
+            check "branch probe/$b arrived" yes "$got"
+          done
+          got=$(git rev-parse --verify -q refs/tags/probe-v1 >/dev/null 2>&1 && echo yes || echo no)
+          check "tag probe-v1 arrived" yes "$got"
+
+          # The whole reason this is not a hand-written `git push --all`. It has
+          # to be a fresh clone: `git show` reads the object out of the database
+          # without running the smudge filter, so it would hand back the pointer
+          # and call a dangling one a pass. Anonymous, because the repository is
+          # public -- a private one would need credentials here.
+          git lfs install --skip-repo
+          rm -rf /tmp/verify
+          if git clone -q --branch probe/main --depth 1 \
+            "https://github.com/${GITHUB_REPOSITORY}.git" /tmp/verify 2>/dev/null; then
+            got=$(sha256sum /tmp/verify/payload.bin | cut -d' ' -f1)
+          else
+            got='(clone failed)'
+          fi
+          check "LFS object is downloadable from GitHub" "$(cat payload.sha256)" "$got"
+
+          # keep_divergent_refs=true. If this one fails the tool is dangerous.
+          got=$(git rev-parse refs/remotes/probe/diverged)
+          check "diverged ref was NOT forced" "$(cat sentinel.sha)" "$got"
+
+          # GitLab must not have deleted what it does not have.
+          got=$(git ls-remote --heads origin main | wc -l | tr -d ' ')
+          check "main survived" 1 "$got"
+
+          exit "$fail"
+
+      - name: Take it back down
+        if: always()
+        run: |
+          set -eu
+          cd "${GITHUB_WORKSPACE}"
+          git push -q origin --delete \
+            refs/heads/probe/main refs/heads/probe/side refs/heads/probe/diverged \
+            refs/tags/probe-v1 2>/dev/null || true
+          docker rm -f gitlab >/dev/null 2>&1 || true
+          echo "cleaned"
